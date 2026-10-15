@@ -973,3 +973,70 @@ test.each([18, 20])("settings popup stays readable and scrolls with mouse and ke
     await view.dispose();
   }
 });
+
+test("compiled ./tui export stays reactive when loaded from a node_modules path", async () => {
+  const { copyFileSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  const { pathToFileURL } = await import("node:url");
+  const pkgDir = resolve(import.meta.dir, "../node_modules/.opencode-plugin-session-token-summary-test");
+  const distDir = resolve(pkgDir, "dist");
+  mkdirSync(distDir, { recursive: true });
+  writeFileSync(resolve(pkgDir, "package.json"), JSON.stringify({ type: "module" }));
+  copyFileSync(resolve(import.meta.dir, "../dist/tui.js"), resolve(distDir, "tui.js"));
+
+  const saved: Record<string, object> = {};
+  const color = RGBA.fromHex("#c6d0f5");
+  let renderDialog: () => JSX.Element;
+  let command: KeymapCommand;
+  let cleanup: (() => void) | undefined;
+  const context = {
+    storage: storageFor(saved),
+    data: { on: () => () => {} },
+    keymap: { layer: (factory: () => { commands: KeymapCommand[] }) => { command = factory().commands[0]; } },
+    ui: {
+      slot: () => () => {},
+      dialog: {
+        show: (render: () => JSX.Element) => { renderDialog = render; },
+        set: () => {},
+        clear: () => {},
+      },
+    },
+    theme: { text: { base: color, muted: color }, border: { base: color } },
+  } as unknown as Context;
+
+  let view: Awaited<ReturnType<typeof testRender>> | undefined;
+  try {
+    const { default: compiledPlugin } = await import(pathToFileURL(resolve(distDir, "tui.js")).href);
+    view = await testRender(() => {
+      cleanup = compiledPlugin.setup(context) as () => void;
+      command.run();
+      return renderDialog();
+    }, { width: 60, height: 24 });
+    await view.flush();
+
+    const isBold = (label: string) => {
+      const spans = view!.captureSpans().lines.flatMap((line) => line.spans);
+      const span = spans.find((s) => s.text.includes(label));
+      return ((span?.attributes ?? 0) & TextAttributes.BOLD) === TextAttributes.BOLD;
+    };
+
+    expect(isBold("Input tokens")).toBe(true);
+    expect(isBold("Output tokens")).toBe(false);
+
+    view.mockInput.pressArrow("down");
+    await view.flush();
+    expect(isBold("Input tokens")).toBe(false);
+    expect(isBold("Output tokens")).toBe(true);
+
+    view.mockInput.pressKey(" ");
+    await view.flush();
+    expect(view.captureCharFrame()).toContain("[x] Input tokens");
+    expect(view.captureCharFrame()).toContain("[ ] Output tokens");
+    expect(isBold("Output tokens")).toBe(true);
+    expect(saved.settings).toMatchObject({ hidden: ["reasoning", "output"] });
+  } finally {
+    cleanup?.();
+    await view?.dispose();
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
