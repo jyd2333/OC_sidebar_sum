@@ -20,8 +20,12 @@ import {
   detectCacheMisses,
   estimateCost,
   estimateCostByProvider,
+  estimateDeepSeekMessageCostCny,
   fetchSessionMessages,
   fetchDescendants,
+  getChinaHolidayCalendar,
+  isDeepSeekPeakTime,
+  MissingHolidayCalendarError,
   sumSessions,
 } from "../usage";
 
@@ -239,23 +243,23 @@ describe("cost estimation", () => {
 
 describe("cost display options", () => {
   test("uses defaults and falls back independently for invalid values", () => {
-    expect(resolveCostOptions(undefined)).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
+    expect(resolveCostOptions(undefined)).toMatchObject({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
     expect(resolveCostOptions({
       usdMultiplier: -1,
       rechargeCnyPerUsd: Number.NaN,
-    })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
+    })).toMatchObject({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
     expect(resolveCostOptions({
       usdMultiplier: Number.POSITIVE_INFINITY,
       rechargeCnyPerUsd: "7.2",
-    })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
+    })).toMatchObject({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
     expect(resolveCostOptions({
       usdMultiplier: 1.5,
       rechargeCnyPerUsd: -0.1,
-    })).toEqual({ usdMultiplier: 1.5, rechargeCnyPerUsd: 7.2 });
+    })).toMatchObject({ usdMultiplier: 1.5, rechargeCnyPerUsd: 7.2 });
     expect(resolveCostOptions({
       usdMultiplier: -1,
       rechargeCnyPerUsd: 8,
-    })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 8 });
+    })).toMatchObject({ usdMultiplier: 1, rechargeCnyPerUsd: 8 });
     const options = {
       usdMultiplier: 2,
       rechargeCnyPerUsd: 8,
@@ -266,11 +270,27 @@ describe("cost display options", () => {
         invalid: { usdMultiplier: -3, rechargeCnyPerUsd: Number.POSITIVE_INFINITY },
       },
     };
-    expect(resolveCostOptions(options, "alpha")).toEqual({ usdMultiplier: 1.25, rechargeCnyPerUsd: 8 });
-    expect(resolveCostOptions(options, "beta")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 6 });
-    expect(resolveCostOptions(options, "Alpha")).toEqual({ usdMultiplier: 9, rechargeCnyPerUsd: 9 });
-    expect(resolveCostOptions(options, "ALPHA")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
-    expect(resolveCostOptions(options, "invalid")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
+    expect(resolveCostOptions(options, "alpha")).toMatchObject({ usdMultiplier: 1.25, rechargeCnyPerUsd: 8 });
+    expect(resolveCostOptions(options, "beta")).toMatchObject({ usdMultiplier: 2, rechargeCnyPerUsd: 6 });
+    expect(resolveCostOptions(options, "Alpha")).toMatchObject({ usdMultiplier: 9, rechargeCnyPerUsd: 9 });
+    expect(resolveCostOptions(options, "ALPHA")).toMatchObject({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
+    expect(resolveCostOptions(options, "invalid")).toMatchObject({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
+  });
+
+  test("resolves native currency and pricing mode at provider scope", () => {
+    const options = {
+      currency: "USD",
+      pricingMode: "standard",
+      providers: {
+        deepseek: { currency: "CNY", pricingMode: "deepseek-schedule" },
+      },
+    };
+    const deepseek = resolveCostOptions(options, "deepseek");
+    expect(deepseek.currency).toBe("CNY");
+    expect(deepseek.pricingMode).toBe("deepseek-schedule");
+    const other = resolveCostOptions(options, "other");
+    expect(other.currency).toBe("USD");
+    expect(other.pricingMode).toBe("standard");
   });
 });
 
@@ -443,6 +463,194 @@ describe("multi-provider cost aggregation", () => {
       cny: 0.007875,
       estimatedByProvider: { alpha: 0.000125, beta: 0.00025 },
     });
+  });
+});
+
+describe("DeepSeek native-CNY schedule pricing", () => {
+  const scheduleOptions = {
+    providers: { deepseek: { currency: "CNY", pricingMode: "deepseek-schedule" } },
+  };
+  const at = (iso: string) => Date.parse(iso);
+
+  function deepseekMessage(id: string, modelID = "deepseek-flash", created = at("2026-01-05T01:00:00Z")) {
+    const message = assistant(id);
+    message.model = { providerID: "deepseek", id: modelID };
+    message.time = { created };
+    message.cost = 999;
+    message.tokens = {
+      input: 1_000_000,
+      output: 100_000,
+      reasoning: 50_000,
+      cache: { read: 100_000, write: 500_000 },
+    };
+    return message;
+  }
+
+  test("uses the annual holiday calendar and treats every weekend as off-peak", () => {
+    expect(getChinaHolidayCalendar(2026)).toMatchObject({
+      holidays: expect.arrayContaining([
+        "2026-01-01", "2026-02-23", "2026-04-04", "2026-05-05",
+        "2026-06-19", "2026-09-27", "2026-10-07",
+      ]),
+      makeupWorkdays: expect.arrayContaining(["2026-01-04", "2026-02-14", "2026-02-28"]),
+    });
+    expect(isDeepSeekPeakTime(at("2026-02-16T01:00:00Z"))).toBe(false); // Spring Festival
+    expect(isDeepSeekPeakTime(at("2026-01-04T02:00:00Z"))).toBe(false); // Sunday makeup workday
+    expect(isDeepSeekPeakTime(at("2026-02-14T02:00:00Z"))).toBe(false); // Saturday makeup workday
+    expect(isDeepSeekPeakTime(at("2026-01-05T01:00:00Z"))).toBe(true); // Monday, 09:00 Beijing
+  });
+
+  test("uses Beijing time and left-closed/right-open peak boundaries", () => {
+    expect(isDeepSeekPeakTime(at("2026-01-05T00:59:59Z"))).toBe(false); // 08:59:59
+    expect(isDeepSeekPeakTime(at("2026-01-05T01:00:00Z"))).toBe(true); // 09:00
+    expect(isDeepSeekPeakTime(at("2026-01-05T03:59:59Z"))).toBe(true); // 11:59:59
+    expect(isDeepSeekPeakTime(at("2026-01-05T04:00:00Z"))).toBe(false); // 12:00
+    expect(isDeepSeekPeakTime(at("2026-01-05T06:00:00Z"))).toBe(true); // 14:00
+    expect(isDeepSeekPeakTime(at("2026-01-05T09:59:59Z"))).toBe(true); // 17:59:59
+    expect(isDeepSeekPeakTime(at("2026-01-05T10:00:00Z"))).toBe(false); // 18:00
+  });
+
+  test("throws a clear missing-year calendar error instead of using a fallback", () => {
+    expect(() => isDeepSeekPeakTime(at("2027-01-04T01:00:00Z")))
+      .toThrow(MissingHolidayCalendarError);
+    expect(() => isDeepSeekPeakTime(at("2027-01-04T01:00:00Z")))
+      .toThrow("No China holiday calendar is available for 2027");
+  });
+
+  test("prices flash and V4 Pro directly in CNY per million tokens", () => {
+    const flashPeak = deepseekMessage("flash-peak");
+    expect(estimateDeepSeekMessageCostCny(flashPeak)).toBeCloseTo(3.204);
+
+    const flashOffPeak = deepseekMessage("flash-off", "deepseek-flash", at("2026-01-05T04:00:00Z"));
+    expect(estimateDeepSeekMessageCostCny(flashOffPeak)).toBeCloseTo(1.602);
+
+    const proPeak = deepseekMessage("pro-peak", "deepseek-v4-pro");
+    expect(estimateDeepSeekMessageCostCny(proPeak)).toBeCloseTo(13.08);
+
+    const proOffPeak = deepseekMessage("pro-off", "deepseek-v4-pro", at("2026-01-05T04:00:00Z"));
+    expect(estimateDeepSeekMessageCostCny(proOffPeak)).toBeCloseTo(6.54);
+    expect(estimateDeepSeekMessageCostCny(deepseekMessage("alias", "some/deepseek_v4_pro")))
+      .toBeCloseTo(13.08);
+    expect(() => estimateDeepSeekMessageCostCny(deepseekMessage("unrelated", "not-deepseek-v4-proxy")))
+      .toThrow("no schedule price");
+  });
+
+  test.each([
+    ["DeepSeek root with necoapi child", "root-ds"],
+    ["necoapi root with DeepSeek child", "child-ds"],
+  ])("does not double count aggregate costs for %s", (_label, deepseekSessionID) => {
+    const ds = deepseekMessage("ds-message");
+    const neco = assistant("neco-message");
+    neco.model = { providerID: "necoapi", id: "metered-model" };
+    neco.cost = 0.5;
+    const sessions = deepseekSessionID === "root-ds"
+      ? [{ id: "root-ds", cost: 50 }, { id: "child-ds", cost: 0.5 }]
+      : [{ id: "root-ds", cost: 0.5 }, { id: "child-ds", cost: 60 }];
+    const groups = [
+      { sessionID: "root-ds", messages: deepseekSessionID === "root-ds" ? [ds] : [neco] },
+      { sessionID: "child-ds", messages: deepseekSessionID === "child-ds" ? [ds] : [neco] },
+    ];
+    const breakdown = computeCostBreakdown(
+      sessions,
+      groups.flatMap((group) => group.messages),
+      [],
+      scheduleOptions,
+      groups,
+    );
+
+    expect(breakdown).toMatchObject({
+      reportedCost: 0.5,
+      cost: 0.5,
+      weightedUsd: 0.5,
+      directCny: 3.204,
+      cny: 6.804,
+      hasUsdCost: true,
+    });
+    expect(breakdown.reportedByProvider).toEqual({ necoapi: 0.5 });
+  });
+
+  test("reports missing timestamps or unknown schedule prices without guessing", () => {
+    const noTime = deepseekMessage("missing-time");
+    Object.defineProperty(noTime, "time", { value: {}, configurable: true });
+    const noModelPrice = deepseekMessage("missing-model", "deepseek-unknown");
+    const breakdown = computeCostBreakdown(
+      [{ id: "root", cost: 100 }],
+      [noTime, noModelPrice],
+      [],
+      scheduleOptions,
+      [{ sessionID: "root", messages: [noTime, noModelPrice] }],
+    );
+
+    expect(breakdown).toMatchObject({
+      reportedCost: 0,
+      cost: 0,
+      weightedUsd: 0,
+      directCny: 0,
+    });
+    expect(breakdown.costError).toContain("requires message.time.created or message.time.completed");
+    expect(breakdown.costError).toContain("no schedule price for model \"deepseek-unknown\"");
+  });
+
+  test("does not apply a top-level DeepSeek schedule to unrelated providers", () => {
+    const message = assistant("not-deepseek");
+    message.model = { providerID: "necoapi", id: "deepseek-flash" };
+    message.cost = 0.5;
+    const breakdown = computeCostBreakdown(
+      [{ id: "root", cost: 0.5 }],
+      [message],
+      [],
+      { pricingMode: "deepseek-schedule" },
+      [{ sessionID: "root", messages: [message] }],
+    );
+    expect(breakdown).toMatchObject({ reportedCost: 0.5, directCny: 0, weightedUsd: 0.5 });
+    expect(breakdown.costError).toBeUndefined();
+  });
+
+  test("requires native CNY currency for DeepSeek schedule mode", () => {
+    const message = deepseekMessage("currency-required");
+    const breakdown = computeCostBreakdown(
+      [{ id: "root", cost: 0.5 }],
+      [message],
+      [],
+      { providers: { deepseek: { currency: "USD", pricingMode: "deepseek-schedule" } } },
+      [{ sessionID: "root", messages: [message] }],
+    );
+
+    expect(breakdown.directCny).toBe(0);
+    expect(breakdown.reportedCost).toBe(0.5);
+    expect(breakdown.costError).toBeUndefined();
+  });
+
+  test("guards standard costs when DeepSeek and another provider share one session", () => {
+    const ds = deepseekMessage("shared-ds");
+    const standard = assistant("shared-standard");
+    standard.model = { providerID: "necoapi", id: "metered-model" };
+    standard.cost = 3;
+    const breakdown = computeCostBreakdown(
+      [{ id: "root", cost: 2 }],
+      [ds, standard],
+      [],
+      scheduleOptions,
+      [{ sessionID: "root", messages: [ds, standard] }],
+    );
+
+    expect(breakdown.directCny).toBeCloseTo(3.204);
+    expect(breakdown.reportedByProvider).toEqual({});
+    expect(breakdown.weightedUsd).toBe(0);
+    expect(breakdown.cny).toBeCloseTo(3.204);
+    expect(breakdown.costError).toContain("exceed the mixed session aggregate");
+  });
+
+  test("uses completed only when created is absent and reports unavailable timestamps", () => {
+    const message = deepseekMessage("completed-fallback");
+    Object.defineProperty(message, "time", {
+      value: { completed: at("2026-01-05T01:00:00Z") },
+      configurable: true,
+    });
+    expect(estimateDeepSeekMessageCostCny(message)).toBeCloseTo(3.204);
+    Object.defineProperty(message, "time", { value: {}, configurable: true });
+    expect(() => estimateDeepSeekMessageCostCny(message))
+      .toThrow("requires message.time.created or message.time.completed");
   });
 });
 
@@ -728,6 +936,52 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     expect(slotRemoved).toBe(true);
   } finally {
     if (!slotRemoved) cleanup?.();
+    await view.dispose();
+  }
+});
+
+test("DeepSeek cost errors render in red without hiding token rows", async () => {
+  const message = assistant("deepseek-no-time");
+  message.model = { providerID: "deepseek", id: "deepseek-flash" };
+  message.cost = 0.25;
+  Object.defineProperty(message, "time", { value: {}, configurable: true });
+  const client = clientFor({}, { root: [message] });
+  let claim: SlotClaim<"sidebar.content">;
+  let cleanup: (() => void) | undefined;
+  const base = RGBA.fromHex("#c6d0f5");
+  const error = RGBA.fromHex("#ed8796");
+  const context = {
+    client,
+    options: { providers: { deepseek: { currency: "CNY", pricingMode: "deepseek-schedule" } } },
+    storage: storageFor({}),
+    keymap: { layer() {} },
+    data: { on: () => () => {} },
+    ui: { slot: (value: SlotClaim<"sidebar.content">) => { claim = value; return () => {}; } },
+    theme: {
+      text: {
+        base,
+        muted: base,
+        feedback: { info: { base }, warning: { base }, error: { base: error } },
+      },
+      border: { base },
+    },
+  } as unknown as Context;
+  const view = await testRender(() => {
+    cleanup = plugin.setup(context) as () => void;
+    return claim.render({ sessionID: "root" });
+  }, { width: 90, height: 16 });
+  try {
+    await view.waitForFrame((frame) => frame.includes("Cost error:"));
+    const frame = view.captureCharFrame();
+    expect(frame).toContain("↑ input");
+    expect(frame).toContain("50");
+    expect(frame).toContain("requires message.time.created or message.time.");
+    expect(frame).toContain("completed for model \"deepseek-flash\"");
+    const errorSpan = view.captureSpans().lines.flatMap((line) => line.spans)
+      .find((span) => span.text.includes("Cost error:"));
+    expect(errorSpan?.fg.equals(error)).toBe(true);
+  } finally {
+    cleanup?.();
     await view.dispose();
   }
 });

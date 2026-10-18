@@ -47,13 +47,18 @@ interface UsageState {
   costMode: "reported" | "estimated" | "mixed";
   weightedUsd: number;
   cny: number;
+  directCny: number;
+  hasUsdCost: boolean;
   turns: number;
   error?: string;
+  costError?: string;
 }
 
 export interface CostDisplayOptions {
   usdMultiplier: number;
   rechargeCnyPerUsd: number;
+  currency?: "CNY" | "USD";
+  pricingMode?: "standard" | "deepseek-schedule";
 }
 
 export function costColorForCny(
@@ -76,6 +81,8 @@ const EMPTY: UsageState = {
   costMode: "reported",
   weightedUsd: 0,
   cny: 0,
+  directCny: 0,
+  hasUsdCost: true,
   turns: 0,
 };
 
@@ -270,6 +277,8 @@ export default Plugin.define({
           costMode: "reported",
           weightedUsd: 0,
           cny: 0,
+          directCny: 0,
+          hasUsdCost: true,
         };
 
         let models: Awaited<ReturnType<typeof context.client.model.list>>["data"] = [];
@@ -295,6 +304,9 @@ export default Plugin.define({
         totals.costMode = costBreakdown.mode;
         totals.weightedUsd = costBreakdown.weightedUsd;
         totals.cny = costBreakdown.cny;
+        totals.directCny = costBreakdown.directCny;
+        totals.hasUsdCost = costBreakdown.hasUsdCost;
+        totals.costError = costBreakdown.costError;
 
         if (disposed || currentLoadID !== loadID) return;
         setState(totals);
@@ -395,11 +407,13 @@ export default Plugin.define({
             error: context.theme.text.feedback.error.base,
           });
         };
-        const cnyLabel = () => state().costMode === "estimated"
-          ? "估算消耗 CNY"
-          : state().costMode === "mixed"
-            ? "消耗 CNY（含估算）"
-            : "实际消耗 CNY";
+        const cnyLabel = () => state().directCny > 0
+          ? "消耗 CNY（含 DeepSeek）"
+          : state().costMode === "estimated"
+            ? "估算消耗 CNY"
+            : state().costMode === "mixed"
+              ? "消耗 CNY（含估算）"
+              : "实际消耗 CNY";
 
         return (
           <box gap={0}>
@@ -446,23 +460,28 @@ export default Plugin.define({
                     <text fg={context.theme.text.base} attributes={TextAttributes.BOLD}>{fmt(totalTokens())}</text>
                   </box>
                 </Show>
-                <Show when={visible("cost", state().cost)}>
-                  <box flexDirection="row" justifyContent="space-between">
-                    <text fg={context.theme.text.muted}>
-                      {state().costMode === "estimated"
-                        ? "$ est. cost"
-                        : state().costMode === "mixed"
-                          ? "$ cost incl. est."
-                          : "$ cost"}
-                    </text>
-                    <text fg={costColor()}>{fmtCost(state().weightedUsd)}</text>
-                  </box>
+                <Show when={visible("cost", state().cost || state().directCny)}>
+                  <Show when={state().hasUsdCost}>
+                    <box flexDirection="row" justifyContent="space-between">
+                      <text fg={context.theme.text.muted}>
+                        {state().costMode === "estimated"
+                          ? "$ est. cost"
+                          : state().costMode === "mixed"
+                            ? "$ cost incl. est."
+                            : "$ cost"}
+                      </text>
+                      <text fg={costColor()}>{fmtCost(state().weightedUsd)}</text>
+                    </box>
+                  </Show>
                   <box flexDirection="row" justifyContent="space-between">
                     <text fg={context.theme.text.muted}>{cnyLabel()}</text>
                     <text fg={costColor()}>{fmtCny(state().cny)}</text>
                   </box>
                 </Show>
               </box>
+            </Show>
+            <Show when={state().costError}>
+              <text fg={context.theme.text.feedback.error.base}>{`Cost error: ${state().costError}`}</text>
             </Show>
           </box>
         );

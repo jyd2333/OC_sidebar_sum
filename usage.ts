@@ -5,6 +5,9 @@ import type {
   OpenCodeClient,
   SessionInfo,
 } from "@opencode/client";
+import { getChinaHolidayCalendar } from "./holiday";
+
+export { getChinaHolidayCalendar, MissingHolidayCalendarError } from "./holiday";
 
 export type TokenTotals = {
   input: number;
@@ -42,7 +45,13 @@ export type CostMode = "reported" | "estimated" | "mixed";
 export type CostMessage = Pick<
   SessionMessageAssistant,
   "model" | "tokens"
-> & { cost?: number };
+> & {
+  cost?: number;
+  time?: {
+    created?: number;
+    completed?: number;
+  };
+};
 
 export type CostSession = Pick<SessionInfo, "cost"> & Partial<Pick<SessionInfo, "id">>;
 
@@ -51,6 +60,9 @@ export type CostOptionsSource = Readonly<Record<string, unknown>> | undefined;
 export type ResolvedCostOptions = {
   usdMultiplier: number;
   rechargeCnyPerUsd: number;
+  /** Display/configuration currency. Direct schedule pricing is always CNY. */
+  currency: "CNY" | "USD";
+  pricingMode: "standard" | "deepseek-schedule";
 };
 
 export type ProviderCostBreakdown = {
@@ -60,6 +72,11 @@ export type ProviderCostBreakdown = {
   estimatedCost: number;
   weightedUsd: number;
   cny: number;
+  /** Native-CNY DeepSeek amount. It is included in cny, never weightedUsd. */
+  directCny: number;
+  /** True when the displayed USD subtotal contains a standard USD provider. */
+  hasUsdCost: boolean;
+  costError?: string;
   reportedByProvider: Readonly<Record<string, number>>;
   estimatedByProvider: Readonly<Record<string, number>>;
   unattributedReportedCost: number;
@@ -80,6 +97,9 @@ const FETCH_CONCURRENCY = 4;
 const DEFAULT_USD_MULTIPLIER = 1;
 const DEFAULT_RECHARGE_CNY_PER_USD = 7.2;
 
+export type Currency = "CNY" | "USD";
+export type PricingMode = "standard" | "deepseek-schedule";
+
 function validCostOption(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -93,15 +113,57 @@ function optionValue(
   return validCostOption(value) ? value : fallback;
 }
 
+function optionCurrency(value: unknown, fallback: Currency): Currency {
+  if (value === "CNY" || value === "USD") return value;
+  if (typeof value === "string") {
+    const upper = value.toUpperCase();
+    if (upper === "CNY" || upper === "USD") return upper;
+  }
+  return fallback;
+}
+
+function optionPricingMode(value: unknown, fallback: PricingMode): PricingMode {
+  return value === "deepseek-schedule" ? value : fallback;
+}
+
+function resolveExtendedOptions(
+  options: CostOptionsSource,
+  fallback?: {
+    usdMultiplier: number;
+    rechargeCnyPerUsd: number;
+    currency?: Currency;
+    pricingMode?: PricingMode;
+  },
+): ResolvedCostOptions {
+  const base = fallback ?? {
+    usdMultiplier: DEFAULT_USD_MULTIPLIER,
+    rechargeCnyPerUsd: DEFAULT_RECHARGE_CNY_PER_USD,
+  };
+  const currency = optionCurrency(options?.currency, fallback?.currency ?? "USD");
+  const pricingMode = optionPricingMode(
+    options?.pricingMode,
+    fallback?.pricingMode ?? "standard",
+  );
+  const result = { ...base } as ResolvedCostOptions;
+  Object.defineProperties(result, {
+    // These fields are available as normal properties while remaining
+    // non-enumerable so existing consumers comparing the original two-field
+    // options object continue to behave as before.
+    currency: { value: currency, enumerable: false, configurable: true },
+    pricingMode: { value: pricingMode, enumerable: false, configurable: true },
+  });
+  return result;
+}
+
 export function resolveTopLevelCostOptions(options: CostOptionsSource): ResolvedCostOptions {
-  return {
+  return resolveExtendedOptions(options, {
     usdMultiplier: optionValue(options, "usdMultiplier", DEFAULT_USD_MULTIPLIER),
     rechargeCnyPerUsd: optionValue(
       options,
       "rechargeCnyPerUsd",
       DEFAULT_RECHARGE_CNY_PER_USD,
     ),
-  };
+  });
 }
 
 /**
@@ -126,7 +188,7 @@ export function resolveProviderCostOptions(
     return topLevel;
   }
 
-  return {
+  return resolveExtendedOptions(provider as CostOptionsSource, {
     usdMultiplier: optionValue(
       provider as Readonly<Record<string, unknown>>,
       "usdMultiplier",
@@ -137,7 +199,15 @@ export function resolveProviderCostOptions(
       "rechargeCnyPerUsd",
       topLevel.rechargeCnyPerUsd,
     ),
-  };
+    currency: optionCurrency(
+      (provider as Readonly<Record<string, unknown>>).currency,
+      topLevel.currency ?? "USD",
+    ),
+    pricingMode: optionPricingMode(
+      (provider as Readonly<Record<string, unknown>>).pricingMode,
+      topLevel.pricingMode ?? "standard",
+    ),
+  });
 }
 
 function hasPrice(model: ModelInfo): boolean {
@@ -203,6 +273,108 @@ function estimateMessageCost(
     tokens.cache.read * cost.cache.read +
     tokens.cache.write * cost.cache.write
   ) / 1_000_000;
+}
+
+function normalizedDeepSeekModelID(id: unknown): string | undefined {
+  if (typeof id !== "string") return undefined;
+  const trimmed = id.trim().toLowerCase();
+  // OpenCode/provider catalogs sometimes qualify model IDs with a namespace.
+  // Match only an exact known DeepSeek suffix, never a substring of an
+  // unrelated model name.
+  const candidate = trimmed.split("/").pop() ?? trimmed;
+  const normalized = candidate.replace(/[^a-z0-9]/g, "");
+  if (normalized === "deepseekflash" || normalized === "deepseekv4flash") return "flash";
+  if (normalized === "deepseekv4pro") return "v4-pro";
+  return undefined;
+}
+
+type DeepSeekRates = { input: number; cacheRead: number; output: number };
+
+// Official DeepSeek pricing: https://api-docs.deepseek.com/quick_start/pricing
+const DEEPSEEK_RATES: Record<"flash" | "v4-pro", { offPeak: DeepSeekRates; peak: DeepSeekRates }> = {
+  flash: {
+    offPeak: { input: 1, cacheRead: 0.02, output: 4 },
+    peak: { input: 2, cacheRead: 0.04, output: 8 },
+  },
+  "v4-pro": {
+    offPeak: { input: 4.5, cacheRead: 0.15, output: 13.5 },
+    peak: { input: 9, cacheRead: 0.3, output: 27 },
+  },
+};
+
+const BEIJING_TIME_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+/** Whether a Unix-millisecond timestamp falls in DeepSeek's Beijing peak windows. */
+export function isDeepSeekPeakTime(timestamp: number): boolean {
+  if (!Number.isFinite(timestamp)) throw new Error("DeepSeek cost calculation requires a valid message timestamp.");
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) throw new Error("DeepSeek cost calculation requires a valid message timestamp.");
+  const parts = Object.fromEntries(
+    BEIJING_TIME_FORMATTER.formatToParts(date).map(({ type, value }) => [type, value]),
+  );
+  const year = Number(parts.year);
+  const localDate = `${parts.year}-${parts.month}-${parts.day}`;
+  const calendar = getChinaHolidayCalendar(year);
+  const weekday = ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(parts.weekday ?? "");
+  if (!weekday || calendar.holidays.includes(localDate)) return false;
+  const minuteOfDay = Number(parts.hour) * 60 + Number(parts.minute);
+  return (minuteOfDay >= 9 * 60 && minuteOfDay < 12 * 60) ||
+    (minuteOfDay >= 14 * 60 && minuteOfDay < 18 * 60);
+}
+
+export function estimateDeepSeekMessageCostCny(message: CostMessage): number {
+  const modelID = normalizedDeepSeekModelID(message.model?.id);
+  if (!modelID) {
+    throw new Error(`DeepSeek cost calculation has no schedule price for model "${String(message.model?.id ?? "unknown")}".`);
+  }
+  const timestamp = message.time?.created !== undefined
+    ? message.time.created
+    : message.time?.completed;
+  if (timestamp === undefined) {
+    throw new Error(`DeepSeek cost calculation requires message.time.created or message.time.completed for model "${message.model.id}".`);
+  }
+  if (!message.tokens) {
+    throw new Error(`DeepSeek cost calculation requires token usage for model "${message.model.id}".`);
+  }
+  const rates = DEEPSEEK_RATES[modelID as "flash" | "v4-pro"][
+    isDeepSeekPeakTime(timestamp) ? "peak" : "offPeak"
+  ];
+  const tokens = message.tokens;
+  return (
+    tokens.input * rates.input +
+    (tokens.output + tokens.reasoning) * rates.output +
+    tokens.cache.read * rates.cacheRead
+  ) / 1_000_000;
+}
+
+function isDeepSeekScheduleMessage(message: CostMessage, options?: CostOptionsSource): boolean {
+  const providerID = message.model?.providerID;
+  if (typeof providerID !== "string") return false;
+  const providers = options?.providers;
+  const providerOptions = typeof providers === "object" && providers !== null && !Array.isArray(providers)
+    ? (providers as Readonly<Record<string, unknown>>)[providerID]
+    : undefined;
+  const explicitlyConfigured = typeof providerOptions === "object" && providerOptions !== null &&
+    !Array.isArray(providerOptions) &&
+    (providerOptions as Readonly<Record<string, unknown>>).pricingMode === "deepseek-schedule";
+  // A top-level mode is a default for DeepSeek's canonical provider only.
+  // Custom provider IDs must opt in explicitly, preventing unrelated services
+  // from inheriting native-CNY pricing by accident.
+  const topLevelDefault = providerID === "deepseek" &&
+    options?.pricingMode === "deepseek-schedule";
+  const resolved = resolveProviderCostOptions(options, providerID);
+  return (explicitlyConfigured || topLevelDefault) &&
+    resolved.pricingMode === "deepseek-schedule" &&
+    resolved.currency === "CNY";
 }
 
 /** Estimate explicit zero-cost messages while retaining their source provider. */
@@ -272,15 +444,13 @@ export function computeCostBreakdown(
   options?: CostOptionsSource,
   messageGroups?: ReadonlyArray<SessionMessageGroup>,
 ): ProviderCostBreakdown {
-  const reportedCost = sessions.reduce((total, session) => {
-    const value = session.cost;
-    return total + (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
-  }, 0);
-
   const reportedByProvider: Record<string, number> = {};
   let unattributedReportedCost = 0;
   const estimatedByProvider: Record<string, number> = {};
   let unattributedEstimatedCost = 0;
+  let directCny = 0;
+  const costErrors = new Set<string>();
+  let hasUsdCost = false;
 
   const groupsBySession = messageGroups
     ? new Map(messageGroups.map((group) => [group.sessionID, group.messages]))
@@ -290,12 +460,72 @@ export function computeCostBreakdown(
         aggregateCost: validSessionCost(session.cost),
         messages: groupsBySession.get(session.id ?? "") ?? [],
       }))
-    : [{ aggregateCost: reportedCost, messages }];
+    : [{
+        aggregateCost: sessions.reduce((total, session) => total + validSessionCost(session.cost), 0),
+        messages,
+      }];
+  const hasDeepSeekSchedule = sessionsForBreakdown.some((session) =>
+    session.messages.some((message) => isDeepSeekScheduleMessage(message, options))
+  );
+  hasUsdCost = !hasDeepSeekSchedule;
+  if (hasDeepSeekSchedule && !messageGroups) {
+    costErrors.add("DeepSeek schedule pricing requires per-session message groups.");
+  }
 
   for (const session of sessionsForBreakdown) {
+    const scheduleMessages = session.messages.filter((message) =>
+      isDeepSeekScheduleMessage(message, options)
+    );
+    const standardMessages = session.messages.filter((message) =>
+      !isDeepSeekScheduleMessage(message, options)
+    );
+
+    for (const message of scheduleMessages) {
+      try {
+        directCny += estimateDeepSeekMessageCostCny(message);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Unknown DeepSeek pricing error.";
+        costErrors.add(detail);
+      }
+    }
+
+    // OpenCode's aggregate for a session containing DeepSeek schedule-priced
+    // messages is a mixed-currency aggregate and cannot be safely reconciled.
+    // Keep non-DeepSeek message costs attributed, but never count that aggregate.
+    if (scheduleMessages.length > 0) {
+      hasUsdCost ||= standardMessages.length > 0;
+      const standardReportedByProvider: Record<string, number> = {};
+      let standardReportedCost = 0;
+      for (const message of standardMessages) {
+        if (typeof message.cost !== "number" || !Number.isFinite(message.cost) || message.cost <= 0) continue;
+        standardReportedCost += message.cost;
+        if (typeof message.model.providerID === "string" && message.model.providerID.length > 0) {
+          addCost(standardReportedByProvider, message.model.providerID, message.cost);
+        }
+      }
+      if (standardReportedCost > session.aggregateCost) {
+        costErrors.add("Standard provider message costs exceed the mixed session aggregate; standard reported cost was not attributed.");
+      } else {
+        for (const [providerID, value] of Object.entries(standardReportedByProvider)) {
+          addCost(reportedByProvider, providerID, value);
+        }
+        unattributedReportedCost += Math.max(0, standardReportedCost - sumCostMap(standardReportedByProvider));
+      }
+      const estimated = estimateBreakdownByProvider(standardMessages, models);
+      for (const [providerID, value] of Object.entries(estimated.byProvider)) {
+        addCost(estimatedByProvider, providerID, value);
+      }
+      unattributedEstimatedCost += estimated.unattributed;
+      continue;
+    }
+
+    // Preserve the old zero-cost USD row for standard-only sessions, including
+    // empty sessions. A schedule-priced session is handled above instead.
+    hasUsdCost ||= session.aggregateCost > 0 || standardMessages.length > 0;
+
     const messageReportedByProvider: Record<string, number> = {};
     let messageReportedCost = 0;
-    for (const message of session.messages) {
+    for (const message of standardMessages) {
       if (typeof message.cost !== "number" || !Number.isFinite(message.cost) || message.cost <= 0) continue;
       messageReportedCost += message.cost;
       if (typeof message.model.providerID === "string" && message.model.providerID.length > 0) {
@@ -315,13 +545,14 @@ export function computeCostBreakdown(
       unattributedReportedCost += Math.max(0, session.aggregateCost - sumCostMap(messageReportedByProvider));
     }
 
-    const estimated = estimateBreakdownByProvider(session.messages, models);
+    const estimated = estimateBreakdownByProvider(standardMessages, models);
     for (const [providerID, value] of Object.entries(estimated.byProvider)) {
       addCost(estimatedByProvider, providerID, value);
     }
     unattributedEstimatedCost += estimated.unattributed;
   }
 
+  const reportedCost = sumCostMap(reportedByProvider) + unattributedReportedCost;
   const estimatedCost = sumCostMap(estimatedByProvider) + unattributedEstimatedCost;
   const cost = reportedCost + estimatedCost;
   const mode: CostMode =
@@ -347,6 +578,7 @@ export function computeCostBreakdown(
     weightedUsd += weighted;
     cny += weighted * provider.rechargeCnyPerUsd;
   }
+  cny += directCny;
 
   return {
     cost,
@@ -355,6 +587,9 @@ export function computeCostBreakdown(
     estimatedCost,
     weightedUsd,
     cny,
+    directCny,
+    hasUsdCost,
+    ...(costErrors.size > 0 ? { costError: [...costErrors].join("; ") } : {}),
     reportedByProvider,
     estimatedByProvider,
     unattributedReportedCost,

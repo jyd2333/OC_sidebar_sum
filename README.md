@@ -62,6 +62,10 @@ without an override:
       "openai": {
         "usdMultiplier": 1,
         "rechargeCnyPerUsd": 7.5
+      },
+      "deepseek": {
+        "currency": "CNY",
+        "pricingMode": "deepseek-schedule"
       }
     }
   }
@@ -76,6 +80,88 @@ defaults are `1` and `7.2`. Missing, negative, non-finite, or non-numeric
 values use the corresponding fallback. Costs that cannot be attributed to a
 provider use the top-level values. For example, a `$1.00` provider subtotal
 with a `1.2` multiplier and `7.2` CNY rate displays as `$1.20` and `¥8.64`.
+
+DeepSeek can be configured for native CNY pricing instead of OpenCode's static
+USD catalog:
+
+```json
+{
+  "package": "E:/path/to/opencode-plugin-session-token-summary",
+  "options": {
+    "currency": "USD",
+    "pricingMode": "standard",
+    "providers": {
+      "deepseek": {
+        "currency": "CNY",
+        "pricingMode": "deepseek-schedule"
+      }
+    }
+  }
+}
+```
+
+`currency` accepts `USD` or `CNY`; `pricingMode` accepts `standard` or
+`deepseek-schedule`. Provider values override the corresponding top-level
+value. DeepSeek schedule mode requires both `currency: "CNY"` and
+`pricingMode: "deepseek-schedule"`. The schedule mode is opt-in and only
+applies to the provider ID whose configuration contains it; unrelated
+providers and model IDs are not inferred to be DeepSeek.
+
+For a configured DeepSeek schedule provider, `deepseek-flash` and
+`deepseek-v4-pro` are billed directly in CNY per million tokens. The formula is
+`(input × inputRate + cacheRead × cacheHitRate + (output + reasoning) ×
+outputRate) / 1,000,000`; cache write tokens are not separately charged by this
+schedule. Flash rates are `1 / 0.02 / 4` off-peak and `2 / 0.04 / 8` peak for
+input/cache-hit/output. V4 Pro rates are `4.5 / 0.15 / 13.5` off-peak and
+`9 / 0.30 / 27` peak. Peak windows use the message timestamp in
+`Asia/Shanghai`: weekdays 09:00–12:00 and 14:00–18:00, left-closed and
+right-open. Weekends remain off-peak even when the official calendar marks a
+makeup workday. Native-CNY amounts are authoritative and are never multiplied
+by `usdMultiplier`, converted through `rechargeCnyPerUsd`, or included in the
+weighted USD subtotal.
+
+The bundled annual calendar is maintained in [`holiday.ts`](holiday.ts). It
+contains the official 2026 schedule and records makeup workdays for reference.
+The source is the State Council General Office notice:
+[国务院办公厅关于2026年部分节假日安排的通知](https://www.scio.gov.cn/zdgz/jj/202511/t20251110_938367.html).
+Missing years intentionally throw `MissingHolidayCalendarError`; the plugin
+reports that as a red cost error instead of silently using the current date or
+an estimated/static model price.
+
+### Updating the annual holiday calendar
+
+This plugin does not query a third-party holiday API at runtime. When the State
+Council publishes the official schedule for a new year:
+
+1. Add the year's holiday dates and makeup workdays to `holiday.ts`.
+2. Add the official source URL and publication reference in a source comment.
+3. Add tests for Beijing time-zone conversion, peak-window boundaries,
+   holidays, weekends, and makeup-workday weekends.
+4. Run the repository checks:
+
+   ```sh
+   npm run check
+   npm run pack:check
+   ```
+
+5. Rebuild the local plugin with `npm run build` if the check did not already
+   rebuild it.
+6. Completely exit and restart the OpenCode TUI.
+7. Commit the calendar, tests, and documentation:
+
+   ```sh
+   git add holiday.ts test README.md
+   git commit -m "data: add YYYY China holiday calendar"
+   ```
+
+Do not add a year before its official schedule is published. If a session
+contains a message from a year that is not in `holiday.ts`, the sidebar keeps
+Token/cache/subagent rows but reports a cost-calculation error.
+
+Dynamic DeepSeek messages use `message.time.created`, falling back to
+`message.time.completed` only when `created` is absent. If both timestamps,
+the annual calendar, or the model schedule price is unavailable, the sidebar
+shows a cost error while retaining token, cache, turn, and subagent rows.
 
 The `0.4.x` package targets the legacy TUI plugin API and cannot be used with
 OpenCode 2.
@@ -126,13 +212,18 @@ and needs no separate API key.
 
 With cache-miss notices enabled, message fetching also includes compaction records.
 
-Reported costs use each OpenCode session's aggregate cost as authoritative.
-Root and descendant sessions are reconciled independently against their own
-assistant-message costs. Message costs attribute each session's aggregate to
-providers only when they do not exceed that session total; any shortfall is
-unattributed and uses top-level multipliers. If message costs exceed a session
-aggregate, only that session's aggregate is treated as unattributed, without
-discarding valid provider attribution from other sessions or double-counting.
+Reported costs use each OpenCode session's aggregate cost as authoritative for
+standard USD providers. Root and descendant sessions are reconciled
+independently against their own assistant-message costs. Message costs
+attribute each session's aggregate to providers only when they do not exceed
+that session total; any shortfall is unattributed and uses top-level
+multipliers. If message costs exceed a session aggregate, only that session's
+aggregate is treated as unattributed, without discarding valid provider
+attribution from other sessions or double-counting. A session containing a
+`deepseek-schedule` message is the exception: its OpenCode aggregate and
+DeepSeek message `cost` values are excluded, and its direct CNY total is
+calculated from tokens and the annual schedule. Non-DeepSeek messages in the
+same root/descendant tree retain the normal USD reconciliation.
 For messages with an explicit zero cost, the plugin uses OpenCode's model
 catalog to estimate the same tokens at published API rates and applies the
 original message provider's multipliers. Fully estimated totals are shown as `$ est. cost`;
