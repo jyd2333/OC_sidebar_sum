@@ -5,7 +5,7 @@ import { TextAttributes, type RGBA, type ScrollBoxRenderable } from "@opentui/co
 import { useTerminalDimensions } from "@opentui/solid";
 import { For, Show, createEffect, createSignal, on } from "solid-js";
 import { version } from "./package.json";
-import { combineCosts, detectCacheMisses, fetchSessionMessages, fetchDescendants, isAssistant, sumSessions } from "./usage";
+import { computeCostBreakdown, detectCacheMisses, fetchSessionMessages, fetchDescendants, isAssistant, resolveProviderCostOptions, sumSessions } from "./usage";
 
 const id = "opencode-session-tokens-sidebar";
 const REFRESH_DELAY_MS = 200;
@@ -42,8 +42,11 @@ interface UsageState {
   reasoning: number;
   cacheRead: number;
   cacheWrite: number;
+  /** Unweighted USD total (reported plus estimates); used for visibility/mode. */
   cost: number;
   costMode: "reported" | "estimated" | "mixed";
+  weightedUsd: number;
+  cny: number;
   turns: number;
   error?: string;
 }
@@ -62,6 +65,8 @@ const EMPTY: UsageState = {
   cacheWrite: 0,
   cost: 0,
   costMode: "reported",
+  weightedUsd: 0,
+  cny: 0,
   turns: 0,
 };
 
@@ -82,15 +87,9 @@ function fmtCny(c: number): string {
 
 export function resolveCostOptions(
   options: Readonly<Record<string, unknown>> | undefined,
+  providerID?: string,
 ): CostDisplayOptions {
-  const option = (name: keyof CostDisplayOptions, fallback: number) => {
-    const value = options?.[name];
-    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
-  };
-  return {
-    usdMultiplier: option("usdMultiplier", 1),
-    rechargeCnyPerUsd: option("rechargeCnyPerUsd", 7.2),
-  };
+  return resolveProviderCostOptions(options, providerID);
 }
 
 function errorMessage(error: unknown): string {
@@ -105,7 +104,7 @@ function errorMessage(error: unknown): string {
 export default Plugin.define({
   id,
   setup(context) {
-    const { usdMultiplier, rechargeCnyPerUsd } = resolveCostOptions(context.options);
+    const costOptions = context.options;
     let disposed = false;
     let loadID = 0;
     let lastSessionID = "";
@@ -260,18 +259,33 @@ export default Plugin.define({
           ...sumSessions([root, ...descendants.sessions], assistantMessages.length),
           status: "ready",
           costMode: "reported",
+          weightedUsd: 0,
+          cny: 0,
         };
 
-        try {
-          if (assistantMessages.some((message) => message.cost === 0 && message.tokens)) {
-            const models = await context.client.model.list({ location: context.location });
-            const combined = combineCosts(totals.cost, assistantMessages, models.data);
-            totals.cost = combined.cost;
-            totals.costMode = combined.mode;
+        let models: Awaited<ReturnType<typeof context.client.model.list>>["data"] = [];
+        if (assistantMessages.some((message) => message.cost === 0 && message.tokens)) {
+          try {
+            const catalog = await context.client.model.list({ location: context.location });
+            models = catalog.data;
+          } catch {
+            // Pricing is optional; reported session totals remain available.
           }
-        } catch {
-          // Pricing is optional; session totals remain available when it cannot load.
         }
+        const costBreakdown = computeCostBreakdown(
+          [root, ...descendants.sessions],
+          assistantMessages,
+          models,
+          costOptions,
+          [
+            { sessionID: root.id, messages: rootMessages.filter(isAssistant) },
+            ...descendants.messageGroups,
+          ],
+        );
+        totals.cost = costBreakdown.cost;
+        totals.costMode = costBreakdown.mode;
+        totals.weightedUsd = costBreakdown.weightedUsd;
+        totals.cny = costBreakdown.cny;
 
         if (disposed || currentLoadID !== loadID) return;
         setState(totals);
@@ -366,7 +380,7 @@ export default Plugin.define({
           return `${(usage.cacheRead / base).toFixed(1)}×`;
         };
         const costColor = () => {
-          const displayedCost = state().cost * usdMultiplier;
+          const displayedCost = state().weightedUsd;
           if (displayedCost < 5) return context.theme.text.feedback.info.base;
           if (displayedCost < 25) return context.theme.text.feedback.warning.base;
           return context.theme.text.feedback.error.base;
@@ -431,11 +445,11 @@ export default Plugin.define({
                           ? "$ cost incl. est."
                           : "$ cost"}
                     </text>
-                    <text fg={costColor()}>{fmtCost(state().cost * usdMultiplier)}</text>
+                    <text fg={costColor()}>{fmtCost(state().weightedUsd)}</text>
                   </box>
                   <box flexDirection="row" justifyContent="space-between">
                     <text fg={context.theme.text.muted}>{cnyLabel()}</text>
-                    <text fg={costColor()}>{fmtCny(state().cost * usdMultiplier * rechargeCnyPerUsd)}</text>
+                    <text fg={costColor()}>{fmtCny(state().cny)}</text>
                   </box>
                 </Show>
               </box>

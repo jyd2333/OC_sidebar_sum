@@ -45,23 +45,37 @@ OpenCode installs the package from npm automatically. Restart the TUI if it does
 not reload.
 
 For a local checkout, configure the plugin directory as an object and set the
-cost multipliers in `options`:
+cost multipliers in `options`. Top-level values are the fallback for providers
+without an override:
 
 ```json
 {
   "package": "E:/path/to/opencode-plugin-session-token-summary",
   "options": {
     "usdMultiplier": 1,
-    "rechargeCnyPerUsd": 7.2
+    "rechargeCnyPerUsd": 7.2,
+    "providers": {
+      "anthropic": {
+        "usdMultiplier": 1.1,
+        "rechargeCnyPerUsd": 7.2
+      },
+      "openai": {
+        "usdMultiplier": 1,
+        "rechargeCnyPerUsd": 7.5
+      }
+    }
   }
 }
 ```
 
-The displayed USD amount is the original cost multiplied by `usdMultiplier`;
-actual CNY consumption is that displayed amount multiplied by
-`rechargeCnyPerUsd`. Both options default to `1` and `7.2`, respectively.
-For example, `usdMultiplier: 1.2` and `rechargeCnyPerUsd: 7.2` display an
-original `$1.00` cost as `$1.20` and `¥8.64`.
+Provider keys must exactly match OpenCode provider IDs. For each provider, the
+displayed USD subtotal is its raw USD cost multiplied by `usdMultiplier`; the
+CNY subtotal is that weighted USD amount multiplied by `rechargeCnyPerUsd`.
+Provider values fall back independently to their top-level counterpart, whose
+defaults are `1` and `7.2`. Missing, negative, non-finite, or non-numeric
+values use the corresponding fallback. Costs that cannot be attributed to a
+provider use the top-level values. For example, a `$1.00` provider subtotal
+with a `1.2` multiplier and `7.2` CNY rate displays as `$1.20` and `¥8.64`.
 
 The `0.4.x` package targets the legacy TUI plugin API and cannot be used with
 OpenCode 2.
@@ -112,13 +126,23 @@ and needs no separate API key.
 
 With cache-miss notices enabled, message fetching also includes compaction records.
 
-Nonzero cost reported by OpenCode is shown as `$ cost`. For messages with an
-explicit zero cost, the plugin uses OpenCode's model
-catalog to calculate what the same tokens would cost at published API rates.
-Fully estimated totals are shown as `$ est. cost`; totals that combine reported
-and estimated amounts are shown as `$ cost incl. est.` Quota or subscription
-users are not necessarily charged the estimated amount. If catalog pricing
-cannot be matched, only the reported cost is shown.
+Reported costs use each OpenCode session's aggregate cost as authoritative.
+Root and descendant sessions are reconciled independently against their own
+assistant-message costs. Message costs attribute each session's aggregate to
+providers only when they do not exceed that session total; any shortfall is
+unattributed and uses top-level multipliers. If message costs exceed a session
+aggregate, only that session's aggregate is treated as unattributed, without
+discarding valid provider attribution from other sessions or double-counting.
+For messages with an explicit zero cost, the plugin uses OpenCode's model
+catalog to estimate the same tokens at published API rates and applies the
+original message provider's multipliers. Fully estimated totals are shown as `$ est. cost`;
+totals combining reported and estimated amounts are shown as `$ cost incl.
+est.` Quota or subscription users are not necessarily charged the estimate.
+Catalog estimates depend on available model pricing and aliases, and may not
+match provider billing, negotiated prices, or discounts. A missing or
+unmatched catalog price contributes no estimate; the reported aggregate remains
+available. Session totals and assistant messages are fetched from the connected
+OpenCode server, while estimates use its model catalog.
 
 ## Development
 

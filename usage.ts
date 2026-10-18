@@ -19,8 +19,14 @@ export type TokenTotals = {
 export type DescendantData = {
   sessions: ReadonlyArray<SessionInfo>;
   messages: ReadonlyArray<SessionMessageAssistant>;
+  messageGroups: ReadonlyArray<SessionMessageGroup>;
   turns: number;
   cacheMisses: ReadonlyArray<CacheMiss>;
+};
+
+export type SessionMessageGroup = {
+  sessionID: string;
+  messages: ReadonlyArray<SessionMessageAssistant>;
 };
 
 export type CacheMiss = {
@@ -33,10 +39,32 @@ export type CacheMiss = {
 
 export type CostMode = "reported" | "estimated" | "mixed";
 
-type CostMessage = Pick<
+export type CostMessage = Pick<
   SessionMessageAssistant,
   "model" | "tokens"
 > & { cost?: number };
+
+export type CostSession = Pick<SessionInfo, "cost"> & Partial<Pick<SessionInfo, "id">>;
+
+export type CostOptionsSource = Readonly<Record<string, unknown>> | undefined;
+
+export type ResolvedCostOptions = {
+  usdMultiplier: number;
+  rechargeCnyPerUsd: number;
+};
+
+export type ProviderCostBreakdown = {
+  cost: number;
+  mode: CostMode;
+  reportedCost: number;
+  estimatedCost: number;
+  weightedUsd: number;
+  cny: number;
+  reportedByProvider: Readonly<Record<string, number>>;
+  estimatedByProvider: Readonly<Record<string, number>>;
+  unattributedReportedCost: number;
+  unattributedEstimatedCost: number;
+};
 
 export const EMPTY: TokenTotals = {
   input: 0,
@@ -49,6 +77,68 @@ export const EMPTY: TokenTotals = {
 };
 
 const FETCH_CONCURRENCY = 4;
+const DEFAULT_USD_MULTIPLIER = 1;
+const DEFAULT_RECHARGE_CNY_PER_USD = 7.2;
+
+function validCostOption(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function optionValue(
+  options: CostOptionsSource,
+  name: keyof ResolvedCostOptions,
+  fallback: number,
+): number {
+  const value = options?.[name];
+  return validCostOption(value) ? value : fallback;
+}
+
+export function resolveTopLevelCostOptions(options: CostOptionsSource): ResolvedCostOptions {
+  return {
+    usdMultiplier: optionValue(options, "usdMultiplier", DEFAULT_USD_MULTIPLIER),
+    rechargeCnyPerUsd: optionValue(
+      options,
+      "rechargeCnyPerUsd",
+      DEFAULT_RECHARGE_CNY_PER_USD,
+    ),
+  };
+}
+
+/**
+ * Resolve one provider's display options. Provider IDs are intentionally not
+ * normalized: OpenCode provider IDs are opaque and must match exactly.
+ */
+export function resolveProviderCostOptions(
+  options: CostOptionsSource,
+  providerID?: string,
+): ResolvedCostOptions {
+  const topLevel = resolveTopLevelCostOptions(options);
+  if (!providerID) return topLevel;
+
+  const providers = options?.providers;
+  if (typeof providers !== "object" || providers === null || Array.isArray(providers)) {
+    return topLevel;
+  }
+  if (!Object.prototype.hasOwnProperty.call(providers, providerID)) return topLevel;
+
+  const provider = (providers as Record<string, unknown>)[providerID];
+  if (typeof provider !== "object" || provider === null || Array.isArray(provider)) {
+    return topLevel;
+  }
+
+  return {
+    usdMultiplier: optionValue(
+      provider as Readonly<Record<string, unknown>>,
+      "usdMultiplier",
+      topLevel.usdMultiplier,
+    ),
+    rechargeCnyPerUsd: optionValue(
+      provider as Readonly<Record<string, unknown>>,
+      "rechargeCnyPerUsd",
+      topLevel.rechargeCnyPerUsd,
+    ),
+  };
+}
 
 function hasPrice(model: ModelInfo): boolean {
   return model.cost.some((cost) =>
@@ -84,28 +174,192 @@ export function estimateCost(
 ): number {
   let total = 0;
   for (const message of messages) {
-    const model = pricingFor(models, message.model.providerID, message.model.id);
-    if (!model || !message.tokens) continue;
-
-    const tokens = message.tokens;
-    const contextTokens = tokens.input + tokens.cache.read + tokens.cache.write;
-    const cost =
-      model.cost
-        .filter(
-          (entry) => entry.tier?.type === "context" && contextTokens > entry.tier.size,
-        )
-        .sort((a, b) => (b.tier?.size ?? 0) - (a.tier?.size ?? 0))[0] ??
-      model.cost.find((entry) => !entry.tier);
-    if (!cost) continue;
-
-    total +=
-      (tokens.input * cost.input +
-        (tokens.output + tokens.reasoning) * cost.output +
-        tokens.cache.read * cost.cache.read +
-        tokens.cache.write * cost.cache.write) /
-      1_000_000;
+    total += estimateMessageCost(message, models);
   }
   return total;
+}
+
+function estimateMessageCost(
+  message: CostMessage,
+  models: ReadonlyArray<ModelInfo>,
+): number {
+  const model = pricingFor(models, message.model.providerID, message.model.id);
+  if (!model || !message.tokens) return 0;
+
+  const tokens = message.tokens;
+  const contextTokens = tokens.input + tokens.cache.read + tokens.cache.write;
+  const cost =
+    model.cost
+      .filter(
+        (entry) => entry.tier?.type === "context" && contextTokens > entry.tier.size,
+      )
+      .sort((a, b) => (b.tier?.size ?? 0) - (a.tier?.size ?? 0))[0] ??
+    model.cost.find((entry) => !entry.tier);
+  if (!cost) return 0;
+
+  return (
+    tokens.input * cost.input +
+    (tokens.output + tokens.reasoning) * cost.output +
+    tokens.cache.read * cost.cache.read +
+    tokens.cache.write * cost.cache.write
+  ) / 1_000_000;
+}
+
+/** Estimate explicit zero-cost messages while retaining their source provider. */
+export function estimateCostByProvider(
+  messages: ReadonlyArray<CostMessage>,
+  models: ReadonlyArray<ModelInfo>,
+): Readonly<Record<string, number>> {
+  return estimateBreakdownByProvider(messages, models).byProvider;
+}
+
+function estimateBreakdownByProvider(
+  messages: ReadonlyArray<CostMessage>,
+  models: ReadonlyArray<ModelInfo>,
+): { byProvider: Record<string, number>; unattributed: number } {
+  const totals: Record<string, number> = {};
+  let unattributed = 0;
+  for (const message of messages) {
+    if (message.cost !== 0) continue;
+    const estimate = estimateMessageCost(message, models);
+    if (!(estimate > 0) || !Number.isFinite(estimate)) continue;
+    if (typeof message.model.providerID === "string" && message.model.providerID.length > 0) {
+      addCost(totals, message.model.providerID, estimate);
+    } else {
+      unattributed += estimate;
+    }
+  }
+  return { byProvider: totals, unattributed };
+}
+
+function sumCostMap(values: Readonly<Record<string, number>>): number {
+  return Object.values(values).reduce((total, value) => total + value, 0);
+}
+
+function validSessionCost(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function addCost(
+  totals: Record<string, number>,
+  providerID: string,
+  value: unknown,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  const current = Object.prototype.hasOwnProperty.call(totals, providerID)
+    ? totals[providerID]!
+    : 0;
+  Object.defineProperty(totals, providerID, {
+    value: current + value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  return value;
+}
+
+/**
+ * Combine session aggregate costs with assistant messages without counting the
+ * same request twice. Session costs are authoritative for the raw reported
+ * total. Message costs are used only to attribute that total to providers when
+ * they reconcile to it; estimates are added only for explicit zero-cost
+ * messages.
+ */
+export function computeCostBreakdown(
+  sessions: ReadonlyArray<CostSession>,
+  messages: ReadonlyArray<CostMessage>,
+  models: ReadonlyArray<ModelInfo>,
+  options?: CostOptionsSource,
+  messageGroups?: ReadonlyArray<SessionMessageGroup>,
+): ProviderCostBreakdown {
+  const reportedCost = sessions.reduce((total, session) => {
+    const value = session.cost;
+    return total + (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
+  }, 0);
+
+  const reportedByProvider: Record<string, number> = {};
+  let unattributedReportedCost = 0;
+  const estimatedByProvider: Record<string, number> = {};
+  let unattributedEstimatedCost = 0;
+
+  const groupsBySession = messageGroups
+    ? new Map(messageGroups.map((group) => [group.sessionID, group.messages]))
+    : undefined;
+  const sessionsForBreakdown = groupsBySession
+    ? sessions.map((session) => ({
+        aggregateCost: validSessionCost(session.cost),
+        messages: groupsBySession.get(session.id ?? "") ?? [],
+      }))
+    : [{ aggregateCost: reportedCost, messages }];
+
+  for (const session of sessionsForBreakdown) {
+    const messageReportedByProvider: Record<string, number> = {};
+    let messageReportedCost = 0;
+    for (const message of session.messages) {
+      if (typeof message.cost !== "number" || !Number.isFinite(message.cost) || message.cost <= 0) continue;
+      messageReportedCost += message.cost;
+      if (typeof message.model.providerID === "string" && message.model.providerID.length > 0) {
+        addCost(messageReportedByProvider, message.model.providerID, message.cost);
+      }
+    }
+
+    // A message total greater than this session's aggregate is stale or
+    // duplicated data. Keep this session's aggregate, but do not make a
+    // misleading provider split. Other sessions remain independently usable.
+    if (messageReportedCost > session.aggregateCost) {
+      unattributedReportedCost += session.aggregateCost;
+    } else {
+      for (const [providerID, value] of Object.entries(messageReportedByProvider)) {
+        addCost(reportedByProvider, providerID, value);
+      }
+      unattributedReportedCost += Math.max(0, session.aggregateCost - sumCostMap(messageReportedByProvider));
+    }
+
+    const estimated = estimateBreakdownByProvider(session.messages, models);
+    for (const [providerID, value] of Object.entries(estimated.byProvider)) {
+      addCost(estimatedByProvider, providerID, value);
+    }
+    unattributedEstimatedCost += estimated.unattributed;
+  }
+
+  const estimatedCost = sumCostMap(estimatedByProvider) + unattributedEstimatedCost;
+  const cost = reportedCost + estimatedCost;
+  const mode: CostMode =
+    estimatedCost > 0
+      ? reportedCost > 0
+        ? "mixed"
+        : "estimated"
+      : "reported";
+
+  const topLevel = resolveTopLevelCostOptions(options);
+  const unattributedCost = unattributedReportedCost + unattributedEstimatedCost;
+  let weightedUsd = unattributedCost * topLevel.usdMultiplier;
+  let cny = weightedUsd * topLevel.rechargeCnyPerUsd;
+  for (const [providerID, value] of Object.entries(reportedByProvider)) {
+    const provider = resolveProviderCostOptions(options, providerID);
+    const weighted = value * provider.usdMultiplier;
+    weightedUsd += weighted;
+    cny += weighted * provider.rechargeCnyPerUsd;
+  }
+  for (const [providerID, value] of Object.entries(estimatedByProvider)) {
+    const provider = resolveProviderCostOptions(options, providerID);
+    const weighted = value * provider.usdMultiplier;
+    weightedUsd += weighted;
+    cny += weighted * provider.rechargeCnyPerUsd;
+  }
+
+  return {
+    cost,
+    mode,
+    reportedCost,
+    estimatedCost,
+    weightedUsd,
+    cny,
+    reportedByProvider,
+    estimatedByProvider,
+    unattributedReportedCost,
+    unattributedEstimatedCost,
+  };
 }
 
 export function combineCosts(
@@ -285,6 +539,7 @@ export async function fetchDescendants(
   const histories = await mapWithConcurrency(out, async (session) => {
     const messages = await fetchSessionMessages(client, session.id, includeCompactions);
     return {
+      sessionID: session.id,
       messages: messages.filter(isAssistant),
       cacheMisses: includeCompactions ? detectCacheMisses(messages, session.id) : [],
     };
@@ -292,5 +547,14 @@ export async function fetchDescendants(
   const messages = histories.flatMap((history) => history.messages);
   const turns = messages.length;
 
-  return { sessions: out, messages, turns, cacheMisses: histories.flatMap((history) => history.cacheMisses) };
+  return {
+    sessions: out,
+    messages,
+    messageGroups: histories.map(({ sessionID, messages: sessionMessages }) => ({
+      sessionID,
+      messages: sessionMessages,
+    })),
+    turns,
+    cacheMisses: histories.flatMap((history) => history.cacheMisses),
+  };
 }

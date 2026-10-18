@@ -15,9 +15,11 @@ import type {
 } from "@opencode/client";
 import {
   combineCosts,
+  computeCostBreakdown,
   computeTotals,
   detectCacheMisses,
   estimateCost,
+  estimateCostByProvider,
   fetchSessionMessages,
   fetchDescendants,
   sumSessions,
@@ -254,6 +256,178 @@ describe("cost display options", () => {
       usdMultiplier: -1,
       rechargeCnyPerUsd: 8,
     })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 8 });
+    const options = {
+      usdMultiplier: 2,
+      rechargeCnyPerUsd: 8,
+      providers: {
+        alpha: { usdMultiplier: 1.25 },
+        beta: { rechargeCnyPerUsd: 6 },
+        Alpha: { usdMultiplier: 9, rechargeCnyPerUsd: 9 },
+        invalid: { usdMultiplier: -3, rechargeCnyPerUsd: Number.POSITIVE_INFINITY },
+      },
+    };
+    expect(resolveCostOptions(options, "alpha")).toEqual({ usdMultiplier: 1.25, rechargeCnyPerUsd: 8 });
+    expect(resolveCostOptions(options, "beta")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 6 });
+    expect(resolveCostOptions(options, "Alpha")).toEqual({ usdMultiplier: 9, rechargeCnyPerUsd: 9 });
+    expect(resolveCostOptions(options, "ALPHA")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
+    expect(resolveCostOptions(options, "invalid")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
+  });
+});
+
+describe("multi-provider cost aggregation", () => {
+  test("weights reconciled root and subagent reported costs by exact provider", () => {
+    const rootMessage = assistant("root-reported");
+    rootMessage.model = { providerID: "alpha", id: "model-a" };
+    rootMessage.cost = 1.5;
+    const childMessage = assistant("child-reported");
+    childMessage.model = { providerID: "beta", id: "model-b" };
+    childMessage.cost = 2.5;
+    const breakdown = computeCostBreakdown(
+      [{ id: "root", cost: 3 }, { id: "child", cost: 4 }],
+      [rootMessage, childMessage],
+      [],
+      {
+        usdMultiplier: 2,
+        rechargeCnyPerUsd: 8,
+        providers: {
+          alpha: { usdMultiplier: 1.2, rechargeCnyPerUsd: 7 },
+          beta: { usdMultiplier: 3, rechargeCnyPerUsd: 6 },
+        },
+      },
+      [
+        { sessionID: "root", messages: [rootMessage] },
+        { sessionID: "child", messages: [childMessage] },
+      ],
+    );
+
+    expect(breakdown).toMatchObject({
+      cost: 7,
+      mode: "reported",
+      reportedCost: 7,
+      estimatedCost: 0,
+      weightedUsd: 15.3,
+      cny: 105.6,
+      reportedByProvider: { alpha: 1.5, beta: 2.5 },
+      unattributedReportedCost: 3,
+    });
+  });
+
+  test("adds a shortfall as unattributed cost and prevents message overcount", () => {
+    const first = assistant("alpha-message");
+    first.model = { providerID: "alpha", id: "model-a" };
+    first.cost = 2;
+    const second = assistant("beta-message");
+    second.model = { providerID: "beta", id: "model-b" };
+    second.cost = 2;
+    const options = {
+      usdMultiplier: 1.5,
+      rechargeCnyPerUsd: 7,
+      providers: { alpha: { usdMultiplier: 2, rechargeCnyPerUsd: 5 } },
+    };
+
+    const delta = computeCostBreakdown([{ cost: 6 }], [first], [], options);
+    expect(delta).toMatchObject({
+      cost: 6,
+      weightedUsd: 10,
+      cny: 62,
+      reportedByProvider: { alpha: 2 },
+      unattributedReportedCost: 4,
+    });
+
+    const overcount = computeCostBreakdown([{ cost: 3 }], [first, second], [], options);
+    expect(overcount).toMatchObject({
+      cost: 3,
+      weightedUsd: 4.5,
+      cny: 31.5,
+      reportedByProvider: {},
+      unattributedReportedCost: 3,
+    });
+  });
+
+  test("reconciles root and child costs independently", () => {
+    const rootMessage = assistant("root-overcount");
+    rootMessage.model = { providerID: "alpha", id: "model-a" };
+    rootMessage.cost = 2;
+    const childMessage = assistant("child-valid");
+    childMessage.model = { providerID: "beta", id: "model-b" };
+    childMessage.cost = 99;
+    const options = {
+      usdMultiplier: 1,
+      rechargeCnyPerUsd: 7,
+      providers: {
+        alpha: { usdMultiplier: 10, rechargeCnyPerUsd: 10 },
+        beta: { usdMultiplier: 2, rechargeCnyPerUsd: 5 },
+      },
+    };
+
+    const rootOvercount = computeCostBreakdown(
+      [{ id: "root", cost: 1 }, { id: "child", cost: 100 }],
+      [rootMessage, childMessage],
+      [],
+      options,
+      [
+        { sessionID: "root", messages: [rootMessage] },
+        { sessionID: "child", messages: [childMessage] },
+      ],
+    );
+    expect(rootOvercount).toMatchObject({
+      cost: 101,
+      reportedByProvider: { beta: 99 },
+      unattributedReportedCost: 2,
+      weightedUsd: 200,
+      cny: 1004,
+    });
+
+    const childOvercount = computeCostBreakdown(
+      [{ id: "root", cost: 100 }, { id: "child", cost: 1 }],
+      [rootMessage, childMessage],
+      [],
+      options,
+      [
+        { sessionID: "root", messages: [rootMessage] },
+        { sessionID: "child", messages: [childMessage] },
+      ],
+    );
+    expect(childOvercount).toMatchObject({
+      cost: 101,
+      reportedByProvider: { alpha: 2 },
+      unattributedReportedCost: 99,
+      weightedUsd: 119,
+      cny: 893,
+    });
+  });
+
+  test("estimates zero-cost messages under their original provider", () => {
+    const first = assistant("alpha-estimate");
+    first.model = { providerID: "alpha", id: "model-a" };
+    first.cost = 0;
+    const second = assistant("beta-estimate");
+    second.model = { providerID: "beta", id: "model-b" };
+    second.cost = 0;
+    const models = [
+      pricedModel("model-a", "alpha", { input: 1, output: 1, cache: { read: 0, write: 0 } }),
+      pricedModel("model-b", "beta", { input: 2, output: 2, cache: { read: 0, write: 0 } }),
+    ];
+    const options = {
+      usdMultiplier: 2,
+      rechargeCnyPerUsd: 7,
+      providers: {
+        alpha: { usdMultiplier: 3, rechargeCnyPerUsd: 5 },
+        beta: { usdMultiplier: 4, rechargeCnyPerUsd: 6 },
+      },
+    };
+
+    expect(estimateCostByProvider([first, second], models)).toEqual({
+      alpha: 0.000125,
+      beta: 0.00025,
+    });
+    expect(computeCostBreakdown([{ cost: 0 }], [first, second], models, options)).toMatchObject({
+      cost: 0.000375,
+      mode: "estimated",
+      weightedUsd: 0.001375,
+      cny: 0.007875,
+      estimatedByProvider: { alpha: 0.000125, beta: 0.00025 },
+    });
   });
 });
 
@@ -334,6 +508,10 @@ describe("descendant fetching", () => {
     await expect(fetchDescendants(client, "root")).resolves.toEqual({
       sessions: [child, grandchild],
       messages: [assistant("child-1"), assistant("grandchild-1")],
+      messageGroups: [
+        { sessionID: "child", messages: [assistant("child-1")] },
+        { sessionID: "grandchild", messages: [assistant("grandchild-1")] },
+      ],
       turns: 2,
       cacheMisses: [],
     });
@@ -452,7 +630,11 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
   let slotRemoved = false;
   const context = {
     client,
-    options: { usdMultiplier: 1.5, rechargeCnyPerUsd: 7.2 },
+    options: {
+      usdMultiplier: 1.5,
+      rechargeCnyPerUsd: 7.2,
+      providers: { provider: { usdMultiplier: 1, rechargeCnyPerUsd: 8 } },
+    },
     storage: storageFor({}),
     keymap: { layer() {} },
     data: {
@@ -484,8 +666,8 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
   try {
     await view.waitForFrame((frame) => frame.includes("2 turns"));
     expect(view.captureCharFrame()).toContain("Session Token Summary");
-    expect(view.captureCharFrame()).toContain("$3.00");
-    expect(view.captureCharFrame()).toContain("¥21.60");
+    expect(view.captureCharFrame()).toContain("$2.50");
+    expect(view.captureCharFrame()).toContain("¥18.80");
     const spans = view.captureSpans().lines.flatMap((line) => line.spans);
     expect(spans.find((span) => span.text.includes("Session Token Summary"))?.fg.equals(color)).toBe(true);
     expect(spans.find((span) => span.text.includes("2 turns"))?.fg.equals(muted)).toBe(true);
@@ -495,7 +677,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     const total = spans.find((span) => span.text.trim() === "132");
     expect(total?.fg.equals(color)).toBe(true);
     expect((total?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
-    expect(spans.find((span) => span.text.includes("$3.00"))?.fg.equals(accent)).toBe(true);
+    expect(spans.find((span) => span.text.includes("$2.50"))?.fg.equals(accent)).toBe(true);
 
     const quota = assistant("quota");
     quota.cost = 0;
@@ -512,8 +694,8 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     expect(pricingStarted).toBe(true);
     select!("other");
     await view.waitForFrame((frame) => frame.includes("1 turn"));
-    expect(view.captureCharFrame()).toContain("$1.50");
-    expect(view.captureCharFrame()).toContain("¥10.80");
+    expect(view.captureCharFrame()).toContain("$1.25");
+    expect(view.captureCharFrame()).toContain("¥9.40");
     pricing.resolve({ data: [], location: { directory: "/" } });
     await view.flush();
     expect(view.captureCharFrame()).toContain("1 turn");
@@ -523,7 +705,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     handlers.get("session.usage.updated")!({ data: { sessionID: "other" } });
     await Bun.sleep(250);
     await view.flush();
-    expect(view.captureCharFrame()).toContain("$1.50");
+    expect(view.captureCharFrame()).toContain("$1.25");
     expect(view.captureCharFrame()).not.toContain("unavailable");
     handlers.get("session.usage.updated")!({ data: { sessionID: "other" } });
     cleanup!();
