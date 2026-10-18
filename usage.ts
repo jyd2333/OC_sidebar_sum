@@ -542,7 +542,18 @@ export function computeCostBreakdown(
       for (const [providerID, value] of Object.entries(messageReportedByProvider)) {
         addCost(reportedByProvider, providerID, value);
       }
-      unattributedReportedCost += Math.max(0, session.aggregateCost - sumCostMap(messageReportedByProvider));
+      const residual = Math.max(0, session.aggregateCost - messageReportedCost);
+      const sessionProviders = standardMessages.map((message) => message.model.providerID);
+      const onlyProvider = sessionProviders[0];
+      const hasSingleKnownProvider = typeof onlyProvider === "string" &&
+        onlyProvider.length > 0 &&
+        sessionProviders.every((providerID) => providerID === onlyProvider);
+      if (residual > 0 && hasSingleKnownProvider) {
+        addCost(reportedByProvider, onlyProvider, residual);
+      } else {
+        unattributedReportedCost += residual;
+      }
+      unattributedReportedCost += Math.max(0, messageReportedCost - sumCostMap(messageReportedByProvider));
     }
 
     const estimated = estimateBreakdownByProvider(standardMessages, models);

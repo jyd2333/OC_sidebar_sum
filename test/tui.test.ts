@@ -340,11 +340,11 @@ describe("multi-provider cost aggregation", () => {
       mode: "reported",
       reportedCost: 7,
       estimatedCost: 0,
-      weightedUsd: 15.3,
-      cny: 105.6,
-      reportedByProvider: { alpha: 1.5, beta: 2.5 },
-      unattributedReportedCost: 3,
+      reportedByProvider: { alpha: 3, beta: 4 },
+      unattributedReportedCost: 0,
     });
+    expect(breakdown.weightedUsd).toBeCloseTo(15.6);
+    expect(breakdown.cny).toBeCloseTo(97.2);
   });
 
   test("adds a shortfall as unattributed cost and prevents message overcount", () => {
@@ -363,10 +363,10 @@ describe("multi-provider cost aggregation", () => {
     const delta = computeCostBreakdown([{ cost: 6 }], [first], [], options);
     expect(delta).toMatchObject({
       cost: 6,
-      weightedUsd: 10,
-      cny: 62,
-      reportedByProvider: { alpha: 2 },
-      unattributedReportedCost: 4,
+      weightedUsd: 12,
+      cny: 60,
+      reportedByProvider: { alpha: 6 },
+      unattributedReportedCost: 0,
     });
 
     const overcount = computeCostBreakdown([{ cost: 3 }], [first, second], [], options);
@@ -377,6 +377,34 @@ describe("multi-provider cost aggregation", () => {
       reportedByProvider: {},
       unattributedReportedCost: 3,
     });
+  });
+
+  test("attributes a session aggregate remainder to its sole provider", () => {
+    const message = assistant("single-provider-remainder");
+    message.model = { providerID: "necoapi", id: "gpt-6.1-sol" };
+    message.cost = 6;
+    const options = {
+      usdMultiplier: 2,
+      rechargeCnyPerUsd: 6.9,
+      providers: {
+        necoapi: { usdMultiplier: 1.445, rechargeCnyPerUsd: 0.03 },
+      },
+    };
+    const breakdown = computeCostBreakdown(
+      [{ id: "root", cost: 10 }],
+      [message],
+      [],
+      options,
+      [{ sessionID: "root", messages: [message] }],
+    );
+
+    expect(breakdown).toMatchObject({
+      reportedCost: 10,
+      reportedByProvider: { necoapi: 10 },
+      unattributedReportedCost: 0,
+    });
+    expect(breakdown.weightedUsd).toBeCloseTo(14.45);
+    expect(breakdown.cny).toBeCloseTo(0.4335);
   });
 
   test("reconciles root and child costs independently", () => {
@@ -407,10 +435,10 @@ describe("multi-provider cost aggregation", () => {
     );
     expect(rootOvercount).toMatchObject({
       cost: 101,
-      reportedByProvider: { beta: 99 },
-      unattributedReportedCost: 2,
-      weightedUsd: 200,
-      cny: 1004,
+      reportedByProvider: { beta: 100 },
+      unattributedReportedCost: 1,
+      weightedUsd: 201,
+      cny: 1007,
     });
 
     const childOvercount = computeCostBreakdown(
@@ -425,10 +453,10 @@ describe("multi-provider cost aggregation", () => {
     );
     expect(childOvercount).toMatchObject({
       cost: 101,
-      reportedByProvider: { alpha: 2 },
-      unattributedReportedCost: 99,
-      weightedUsd: 119,
-      cny: 893,
+      reportedByProvider: { alpha: 100 },
+      unattributedReportedCost: 1,
+      weightedUsd: 1001,
+      cny: 10007,
     });
   });
 
@@ -889,8 +917,8 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
   try {
     await view.waitForFrame((frame) => frame.includes("2 turns"));
     expect(view.captureCharFrame()).toContain("Session Token Summary");
-    expect(view.captureCharFrame()).toContain("$2.50");
-    expect(view.captureCharFrame()).toContain("¥18.80");
+    expect(view.captureCharFrame()).toContain("$2.00");
+    expect(view.captureCharFrame()).toContain("¥16.00");
     const spans = view.captureSpans().lines.flatMap((line) => line.spans);
     expect(spans.find((span) => span.text.includes("Session Token Summary"))?.fg.equals(color)).toBe(true);
     expect(spans.find((span) => span.text.includes("2 turns"))?.fg.equals(muted)).toBe(true);
@@ -900,7 +928,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     const total = spans.find((span) => span.text.trim() === "132");
     expect(total?.fg.equals(color)).toBe(true);
     expect((total?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
-    expect(spans.find((span) => span.text.includes("$2.50"))?.fg.equals(color)).toBe(true);
+    expect(spans.find((span) => span.text.includes("$2.00"))?.fg.equals(color)).toBe(true);
 
     const quota = assistant("quota");
     quota.cost = 0;
@@ -917,8 +945,8 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     expect(pricingStarted).toBe(true);
     select!("other");
     await view.waitForFrame((frame) => frame.includes("1 turn"));
-    expect(view.captureCharFrame()).toContain("$1.25");
-    expect(view.captureCharFrame()).toContain("¥9.40");
+    expect(view.captureCharFrame()).toContain("$1.00");
+    expect(view.captureCharFrame()).toContain("¥8.00");
     pricing.resolve({ data: [], location: { directory: "/" } });
     await view.flush();
     expect(view.captureCharFrame()).toContain("1 turn");
@@ -928,7 +956,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     handlers.get("session.usage.updated")!({ data: { sessionID: "other" } });
     await Bun.sleep(250);
     await view.flush();
-    expect(view.captureCharFrame()).toContain("$1.25");
+    expect(view.captureCharFrame()).toContain("$1.00");
     expect(view.captureCharFrame()).not.toContain("unavailable");
     handlers.get("session.usage.updated")!({ data: { sessionID: "other" } });
     cleanup!();
