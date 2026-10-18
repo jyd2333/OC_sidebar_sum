@@ -44,6 +44,25 @@ entry. Preserve other plugins and settings:
 OpenCode installs the package from npm automatically. Restart the TUI if it does
 not reload.
 
+For a local checkout, configure the plugin directory as an object and set the
+cost multipliers in `options`:
+
+```json
+{
+  "package": "E:/path/to/opencode-plugin-session-token-summary",
+  "options": {
+    "usdMultiplier": 1,
+    "rechargeCnyPerUsd": 7.2
+  }
+}
+```
+
+The displayed USD amount is the original cost multiplied by `usdMultiplier`;
+actual CNY consumption is that displayed amount multiplied by
+`rechargeCnyPerUsd`. Both options default to `1` and `7.2`, respectively.
+For example, `usdMultiplier: 1.2` and `rechargeCnyPerUsd: 7.2` display an
+original `$1.00` cost as `$1.20` and `¥8.64`.
+
 The `0.4.x` package targets the legacy TUI plugin API and cannot be used with
 OpenCode 2.
 
@@ -104,7 +123,7 @@ cannot be matched, only the reported cost is shown.
 ## Development
 
 ```sh
-npm install
+npm ci
 npm run check
 npm run pack:check
 ```

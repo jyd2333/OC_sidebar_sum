@@ -48,6 +48,11 @@ interface UsageState {
   error?: string;
 }
 
+export interface CostDisplayOptions {
+  usdMultiplier: number;
+  rechargeCnyPerUsd: number;
+}
+
 const EMPTY: UsageState = {
   status: "loading",
   input: 0,
@@ -71,6 +76,23 @@ function fmtCost(c: number): string {
   return "$" + c.toFixed(2);
 }
 
+function fmtCny(c: number): string {
+  return "¥" + c.toFixed(2);
+}
+
+export function resolveCostOptions(
+  options: Readonly<Record<string, unknown>> | undefined,
+): CostDisplayOptions {
+  const option = (name: keyof CostDisplayOptions, fallback: number) => {
+    const value = options?.[name];
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+  };
+  return {
+    usdMultiplier: option("usdMultiplier", 1),
+    rechargeCnyPerUsd: option("rechargeCnyPerUsd", 7.2),
+  };
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -83,6 +105,7 @@ function errorMessage(error: unknown): string {
 export default Plugin.define({
   id,
   setup(context) {
+    const { usdMultiplier, rechargeCnyPerUsd } = resolveCostOptions(context.options);
     let disposed = false;
     let loadID = 0;
     let lastSessionID = "";
@@ -343,10 +366,16 @@ export default Plugin.define({
           return `${(usage.cacheRead / base).toFixed(1)}×`;
         };
         const costColor = () => {
-          if (state().cost < 5) return context.theme.text.feedback.info.base;
-          if (state().cost < 25) return context.theme.text.feedback.warning.base;
+          const displayedCost = state().cost * usdMultiplier;
+          if (displayedCost < 5) return context.theme.text.feedback.info.base;
+          if (displayedCost < 25) return context.theme.text.feedback.warning.base;
           return context.theme.text.feedback.error.base;
         };
+        const cnyLabel = () => state().costMode === "estimated"
+          ? "估算消耗 CNY"
+          : state().costMode === "mixed"
+            ? "消耗 CNY（含估算）"
+            : "实际消耗 CNY";
 
         return (
           <box gap={0}>
@@ -402,7 +431,11 @@ export default Plugin.define({
                           ? "$ cost incl. est."
                           : "$ cost"}
                     </text>
-                    <text fg={costColor()}>{fmtCost(state().cost)}</text>
+                    <text fg={costColor()}>{fmtCost(state().cost * usdMultiplier)}</text>
+                  </box>
+                  <box flexDirection="row" justifyContent="space-between">
+                    <text fg={context.theme.text.muted}>{cnyLabel()}</text>
+                    <text fg={costColor()}>{fmtCny(state().cost * usdMultiplier * rechargeCnyPerUsd)}</text>
                   </box>
                 </Show>
               </box>

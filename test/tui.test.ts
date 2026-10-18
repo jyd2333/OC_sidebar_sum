@@ -5,7 +5,7 @@ import { testRender, type JSX } from "@opentui/solid";
 import { Show, createComponent, createSignal } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { version } from "../package.json";
-import plugin from "../tui";
+import plugin, { resolveCostOptions } from "../tui";
 import type {
   SessionMessageAssistant as AssistantMessage,
   SessionMessageInfo,
@@ -235,6 +235,28 @@ describe("cost estimation", () => {
   });
 });
 
+describe("cost display options", () => {
+  test("uses defaults and falls back independently for invalid values", () => {
+    expect(resolveCostOptions(undefined)).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
+    expect(resolveCostOptions({
+      usdMultiplier: -1,
+      rechargeCnyPerUsd: Number.NaN,
+    })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
+    expect(resolveCostOptions({
+      usdMultiplier: Number.POSITIVE_INFINITY,
+      rechargeCnyPerUsd: "7.2",
+    })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 7.2 });
+    expect(resolveCostOptions({
+      usdMultiplier: 1.5,
+      rechargeCnyPerUsd: -0.1,
+    })).toEqual({ usdMultiplier: 1.5, rechargeCnyPerUsd: 7.2 });
+    expect(resolveCostOptions({
+      usdMultiplier: -1,
+      rechargeCnyPerUsd: 8,
+    })).toEqual({ usdMultiplier: 1, rechargeCnyPerUsd: 8 });
+  });
+});
+
 describe("descendant fetching", () => {
   test("follows message cursors and requests only assistant messages", async () => {
     const client = clientFor({}, {});
@@ -430,6 +452,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
   let slotRemoved = false;
   const context = {
     client,
+    options: { usdMultiplier: 1.5, rechargeCnyPerUsd: 7.2 },
     storage: storageFor({}),
     keymap: { layer() {} },
     data: {
@@ -461,7 +484,8 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
   try {
     await view.waitForFrame((frame) => frame.includes("2 turns"));
     expect(view.captureCharFrame()).toContain("Session Token Summary");
-    expect(view.captureCharFrame()).toContain("$2.00");
+    expect(view.captureCharFrame()).toContain("$3.00");
+    expect(view.captureCharFrame()).toContain("¥21.60");
     const spans = view.captureSpans().lines.flatMap((line) => line.spans);
     expect(spans.find((span) => span.text.includes("Session Token Summary"))?.fg.equals(color)).toBe(true);
     expect(spans.find((span) => span.text.includes("2 turns"))?.fg.equals(muted)).toBe(true);
@@ -471,7 +495,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     const total = spans.find((span) => span.text.trim() === "132");
     expect(total?.fg.equals(color)).toBe(true);
     expect((total?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
-    expect(spans.find((span) => span.text.includes("$2.00"))?.fg.equals(accent)).toBe(true);
+    expect(spans.find((span) => span.text.includes("$3.00"))?.fg.equals(accent)).toBe(true);
 
     const quota = assistant("quota");
     quota.cost = 0;
@@ -488,7 +512,8 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     expect(pricingStarted).toBe(true);
     select!("other");
     await view.waitForFrame((frame) => frame.includes("1 turn"));
-    expect(view.captureCharFrame()).toContain("$1.00");
+    expect(view.captureCharFrame()).toContain("$1.50");
+    expect(view.captureCharFrame()).toContain("¥10.80");
     pricing.resolve({ data: [], location: { directory: "/" } });
     await view.flush();
     expect(view.captureCharFrame()).toContain("1 turn");
@@ -498,7 +523,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     handlers.get("session.usage.updated")!({ data: { sessionID: "other" } });
     await Bun.sleep(250);
     await view.flush();
-    expect(view.captureCharFrame()).toContain("$1.00");
+    expect(view.captureCharFrame()).toContain("$1.50");
     expect(view.captureCharFrame()).not.toContain("unavailable");
     handlers.get("session.usage.updated")!({ data: { sessionID: "other" } });
     cleanup!();
@@ -524,6 +549,7 @@ test("sidebar settings support mouse, keyboard, version display, persistence, an
   const color = RGBA.fromHex("#c6d0f5");
   const context = {
     client,
+    options: { usdMultiplier: 1, rechargeCnyPerUsd: 7.2 },
     data: {
       on(type: string, handler: (event: { data: { sessionID: string } }) => void) {
         handlers.set(type, handler);
@@ -575,6 +601,7 @@ test("sidebar settings support mouse, keyboard, version display, persistence, an
   };
   try {
     await view.waitForFrame((frame) => frame.includes("↑ input"));
+    expect(view.captureCharFrame()).toContain("¥7.20");
     await clickText("Session Token Summary", 2);
     expect(dialog()).toBeUndefined();
     await clickText("Session Token Summary");
@@ -670,7 +697,13 @@ test("sidebar settings support mouse, keyboard, version display, persistence, an
       await restarted.mockMouse.click(lines[y].indexOf(text), y);
       await restarted.flush();
       expect(restarted.captureCharFrame()).not.toContain(sidebarText);
+      if (option === "Cost") {
+        expect(restarted.captureCharFrame()).not.toContain("实际消耗 CNY");
+        expect(restarted.captureCharFrame()).not.toContain("¥7.20");
+      }
     }
+    expect(restarted.captureCharFrame()).not.toContain("实际消耗 CNY");
+    expect(restarted.captureCharFrame()).not.toContain("¥7.20");
     expect(restarted.captureCharFrame()).toContain("Session Token Summary");
     restarted.mockInput.pressTab();
     restarted.mockInput.pressKey(" ");
@@ -702,7 +735,10 @@ test("sidebar settings support mouse, keyboard, version display, persistence, an
     await legacy.waitForFrame((frame) => frame.includes("[ ] Hide empty rows"));
     expect(legacy.captureCharFrame()).toContain("[x] Thinking tokens");
     await clickText("[ ] Hide empty rows", 0, legacy);
-    for (const label of ["↑ input", "↓ output", "▤ cache write", "▤ cache read", "ø cache hit", "✦ think", "Σ total", "$0.00", "0 turns"]) {
+    for (const label of [
+      "↑ input", "↓ output", "▤ cache write", "▤ cache read", "ø cache hit", "✦ think",
+      "Σ total", "$0.00", "实际消耗 CNY", "¥0.00", "0 turns",
+    ]) {
       expect(legacy.captureCharFrame()).not.toContain(label);
     }
     expect(legacy.captureCharFrame().split("Session Token Summary")).toHaveLength(3);
