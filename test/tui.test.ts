@@ -5,7 +5,7 @@ import { testRender, type JSX } from "@opentui/solid";
 import { Show, createComponent, createSignal } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { version } from "../package.json";
-import plugin, { resolveCostOptions } from "../tui";
+import plugin, { costColorForCny, resolveCostOptions } from "../tui";
 import type {
   SessionMessageAssistant as AssistantMessage,
   SessionMessageInfo,
@@ -271,6 +271,21 @@ describe("cost display options", () => {
     expect(resolveCostOptions(options, "Alpha")).toEqual({ usdMultiplier: 9, rechargeCnyPerUsd: 9 });
     expect(resolveCostOptions(options, "ALPHA")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
     expect(resolveCostOptions(options, "invalid")).toEqual({ usdMultiplier: 2, rechargeCnyPerUsd: 8 });
+  });
+});
+
+describe("cost display colors", () => {
+  test("uses final CNY boundaries for info, warning, and error", () => {
+    const colors = {
+      info: RGBA.fromHex("#111111"),
+      warning: RGBA.fromHex("#222222"),
+      error: RGBA.fromHex("#333333"),
+    };
+
+    expect(costColorForCny(4.99, colors)).toBe(colors.info);
+    expect(costColorForCny(5, colors)).toBe(colors.warning);
+    expect(costColorForCny(19.99, colors)).toBe(colors.warning);
+    expect(costColorForCny(20, colors)).toBe(colors.error);
   });
 });
 
@@ -677,7 +692,7 @@ test("V2 plugin renders, switches sessions, retains totals on failure, and clean
     const total = spans.find((span) => span.text.trim() === "132");
     expect(total?.fg.equals(color)).toBe(true);
     expect((total?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
-    expect(spans.find((span) => span.text.includes("$2.50"))?.fg.equals(accent)).toBe(true);
+    expect(spans.find((span) => span.text.includes("$2.50"))?.fg.equals(color)).toBe(true);
 
     const quota = assistant("quota");
     quota.cost = 0;

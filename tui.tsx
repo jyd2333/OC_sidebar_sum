@@ -56,6 +56,15 @@ export interface CostDisplayOptions {
   rechargeCnyPerUsd: number;
 }
 
+export function costColorForCny(
+  cny: number,
+  colors: { info: RGBA; warning: RGBA; error: RGBA },
+): RGBA {
+  if (cny < 5) return colors.info;
+  if (cny < 20) return colors.warning;
+  return colors.error;
+}
+
 const EMPTY: UsageState = {
   status: "loading",
   input: 0,
@@ -380,10 +389,11 @@ export default Plugin.define({
           return `${(usage.cacheRead / base).toFixed(1)}×`;
         };
         const costColor = () => {
-          const displayedCost = state().weightedUsd;
-          if (displayedCost < 5) return context.theme.text.feedback.info.base;
-          if (displayedCost < 25) return context.theme.text.feedback.warning.base;
-          return context.theme.text.feedback.error.base;
+          return costColorForCny(state().cny, {
+            info: context.theme.text.feedback.info.base,
+            warning: context.theme.text.feedback.warning.base,
+            error: context.theme.text.feedback.error.base,
+          });
         };
         const cnyLabel = () => state().costMode === "estimated"
           ? "估算消耗 CNY"
